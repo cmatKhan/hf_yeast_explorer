@@ -1,0 +1,90 @@
+(---
+title: "request_19"
+output: html_document
+---
+
+```{r}
+library(reticulate)
+library(here)
+library(tidyverse)
+library(RColorBrewer)
+
+venv_path = here(".venv")
+
+virtualenv_create(venv_path)
+virtualenv_install(
+  envname = venv_path,
+  packages = character(0),
+  pip_options = c("-e", "/home/chase/code/tfbp/tfbpapi")
+)
+# virtualenv_install(venv_path,
+#                    packages = "-e /home/chase/code/tfbpmodeling")
+# packages = c("git+https://github.com/cmatKhan/tfbpmodeling.git@lassocv_sequential_rewrite")
+
+use_virtualenv(venv_path, required = TRUE)
+```
+
+```{r}
+barkai_meta_GSE222268 = arrow::read_parquet("~/code/hf/barkai_compendium/GSE222268_metadata.parquet")
+barkai_meta_GSE209631 = arrow::read_parquet("~/code/hf/barkai_compendium/GSE209631_metadata.parquet")
+barkai_meta_GSE178430 = arrow::read_parquet("~/code/hf/barkai_compendium/GSE178430_metadata.parquet")
+
+barkai_meta_GSE222268_standard = barkai_meta_GSE222268 %>%
+    filter(str_detect(experiment_details, "^\\d$|^\\d\\w$"))
+
+barkai_meta_GSE209631_standard = barkai_meta_GSE209631 %>%
+    filter(variant_type == "TF")
+    
+
+barkai_meta_GSE178430_standard = barkai_meta_GSE178430 %>%
+    filter(dbd_donor_symbol == "none",
+           ortholog_donor == "none",
+           paralog_deletion_symbol == "none",
+           paralog_resistance_cassette == "none") %>%
+    mutate(
+        regulator_locus_tag = case_when(
+            regulator_symbol == "YAP4" ~ "YOR028C",
+            .default = regulator_locus_tag),
+        regulator_symbol = case_when(
+            regulator_symbol == "YAP4" ~ "CIN5",
+            .default = regulator_symbol)
+        )
+```
+
+```{r}
+brentlab_chec_symbols = c("AFT2",  "ARG80", "CBF1", "CST6", "DAL82", "LEU3", "MSN4", "YOX1")
+genomic_features = arrow::read_parquet("~/code/hf/yeast_genome_resources/brentlab_features.parquet")
+
+brentlab_chec_locustag = genomic_features %>%
+    filter(symbol %in% brentlab_chec_symbols) %>%
+    pull(locus_tag)
+
+mahendrawada = arrow::read_parquet("~/code/hf/mahendrawada_2025/reprocess_diffcontrol_5prime.parquet")
+
+barkai_compendium_manifest = readxl::read_excel("data/barkai_compendium_manifest_from_offir_etal.xlsx") %>%
+    filter(ChEC_Profile)
+
+unique(mahendrawada$regulator_locus_tag)
+```
+
+```{r}
+setdiff(brentlab_chec_locustag, barkai_compendium_manifest$SystematicName)
+
+union_set = tibble(
+    regulator_locus_tag = Reduce(
+        union,
+        list(barkai_compendium_manifest$SystematicName,
+             mahendrawada$regulator_locus_tag,
+             brentlab_chec_locustag))) %>%
+    mutate(mahendrawada = regulator_locus_tag %in% unique(mahendrawada$regulator_locus_tag),
+           barkai = regulator_locus_tag %in% barkai_compendium_manifest$SystematicName,
+           brent = regulator_locus_tag %in% brentlab_chec_locustag) %>%
+    left_join(
+        genomic_features %>%
+            select(locus_tag, symbol) %>%
+            dplyr::rename(regulator_locus_tag = locus_tag,
+                          regulator_symbol = symbol)) %>%
+    dplyr::relocate(regulator_locus_tag, regulator_symbol)
+
+# write_csv(union_set, "results/barkai_mahendrawada_brent_regulators.csv")
+```

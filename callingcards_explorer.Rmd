@@ -1,0 +1,49 @@
+---
+title: "callingcards_explorer"
+output: html_document
+---
+
+```{r}
+library(reticulate)
+library(here)
+library(tidyverse)
+library(RColorBrewer)
+
+venv_path = here(".venv")
+
+# virtualenv_create(venv_path)
+# virtualenv_install(
+#   envname = venv_path,
+#   packages = character(0),
+#   pip_options = c("-e", "/home/chase/code/tfbp/tfbpapi")
+# )
+# virtualenv_install(venv_path,
+#                    packages = "-e /home/chase/code/tfbpmodeling")
+# packages = c("git+https://github.com/cmatKhan/tfbpmodeling.git@lassocv_sequential_rewrite")
+
+use_virtualenv(venv_path, required = TRUE)
+```
+
+```{r}
+library(arrow)
+
+orig_af = list(
+    af = 
+        arrow::open_dataset("~/code/hf/callingcards/annotated_features") %>%
+        collect() %>%
+        left_join(arrow::read_parquet(
+            "~/code/hf/callingcards/annotated_features_meta.parquet")),
+    combined =
+        arrow::open_dataset("~/code/hf/callingcards/annotated_features_combined") %>%
+        collect() %>%
+        left_join(arrow::read_parquet(
+            "~/code/hf/callingcards/annotated_features_combined_meta.parquet")),
+    repro =
+        arrow::open_dataset("~/code/hf/callingcards/annotated_features_orig_reprocess") %>%
+        collect() %>%
+        left_join(arrow::read_parquet("~/code/hf/callingcards/genome_map_meta.parquet"))
+)
+
+
+```
+
