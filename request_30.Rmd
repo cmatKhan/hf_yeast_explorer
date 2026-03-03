@@ -80,8 +80,17 @@ library(future.apply)
 library(progressr)
 library(data.table)
 
+# had do do this in console -- set to false then to true
+handlers(global = TRUE)
+handlers("progress")  # or "cli" if you have the cli package
+```
+
+```{r}
 plan(multisession, workers = 6)
 data.table::setDTthreads(5)
+
+# verify workers are actually spawned
+print(future::nbrOfWorkers())
 
 group_cols_standard = c('sample_id', 'regulator_locus_tag', 'regulator_symbol',
                         'target_locus_tag', 'target_symbol')
@@ -89,13 +98,13 @@ group_cols_hu = c(group_cols_standard, 'heat_shock', 'tetracycline_treatment')
 
 dedup_by_max_abs_fc = function(path, group_cols) {
     dt = data.table::as.data.table(arrow::read_parquet(path))
-    dt[dt[, .I[which.max(abs(mean_norm_log2fc))], by = group_cols]$V1]
+    dt[dt[, .I[which.max(abs(mean_norm_log2fc))], by = group_cols]$V1] |> as_tibble()
 }
 
 dedup_by_min_pval = function(path, group_cols, pval_col, pre_filter = NULL) {
     dt = data.table::as.data.table(arrow::read_parquet(path))
     if (!is.null(pre_filter)) dt = pre_filter(dt)
-    dt[dt[, .I[which.min(get(pval_col))], by = group_cols]$V1]
+    dt[dt[, .I[which.min(get(pval_col))], by = group_cols]$V1] |> as_tibble()
 }
 
 tasks = list(
@@ -116,14 +125,6 @@ tasks = list(
         pre_filter = function(dt) dt[env_condition == 'standard_30C'])
 )
 
-plan(multisession, workers = 6)
-data.table::setDTthreads(5)
-
-# verify workers are actually spawned
-print(future::nbrOfWorkers())
-
-handlers(global = TRUE)
-handlers("progress")  # or "cli" if you have the cli package
 
 with_progress({
     p = progressor(along = tasks)
@@ -193,6 +194,12 @@ hackett_time_join_df = hackett_analysis_set_no_replicates %>%
 ```
 
 ```{r}
+
+# NOTE! Previously, we did not use a log2fc threshold on kemmeren to assign
+# responsiveness. This is set here such that the 'only pval' threshold is used
+perturbation_data$kemmeren$hf_responsive = perturbation_data$kemmeren$responsive
+perturbation_data$kemmeren$responsive = perturbation_data$kemmeren$pval <= 0.05
+
 perturbation_data$hackett_cleaned = perturbation_data$hackett %>%
     filter(sample_id %in% hackett_analysis_set_no_replicates$sample_id) %>%
     group_by(sample_id, target_locus_tag) %>%
@@ -613,7 +620,8 @@ nature_colors = c(
 )
 
 binding_perturbation_summary %>%
-    filter(perturbation_source %in% c("2007 TFKO", "2020 Overexpression", "2025 Degron")) %>%
+    filter(perturbation_source %in% c("2007 TFKO", "2014 TFKO",
+                                      "2020 Overexpression", "2025 Degron")) %>%
     mutate(percent_responsive = responsive_ratio * 100) %>%
     ggplot(aes(binding_source, percent_responsive, fill = binding_source)) +
     geom_boxplot() +
@@ -639,12 +647,14 @@ binding_perturbation_summary %>%
 ```{r}
 perturbation_colors = c(
     "2007 TFKO"           = "#8491B4",
+    "2014 TFKO"           = "#F39B7F",
     "2020 Overexpression" = "#91D1C2",
     "2025 Degron"         = "#B09C85"
 )
 
 binding_perturbation_summary %>%
-    filter(perturbation_source %in% c("2007 TFKO", "2020 Overexpression", "2025 Degron")) %>%
+    filter(perturbation_source %in% c("2007 TFKO", "2014 TFKO",
+                                      "2020 Overexpression", "2025 Degron")) %>%
     mutate(percent_responsive = responsive_ratio * 100) %>%
     ggplot(aes(perturbation_source, percent_responsive, fill = perturbation_source)) +
     geom_boxplot() +
@@ -665,5 +675,15 @@ binding_perturbation_summary %>%
         legend.text = element_text(size = 10),
         legend.title = element_text(size = 10)
     )
+```
+
+```{r}
+# median across all methods
+binding_perturbation_summary %>%
+    filter(perturbation_source %in% c("2007 TFKO", "2014 TFKO",
+                                      "2020 Overexpression", "2025 Degron")) %>%
+    mutate(n_responsive_top25 = responsive_ratio*n) %>%
+    pull(n_responsive_top25) %>%
+    summary()
 ```
 

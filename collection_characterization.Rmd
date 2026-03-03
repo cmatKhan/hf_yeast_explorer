@@ -1,0 +1,97 @@
+---
+title: "collection_characterization"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(here)
+library(here)
+```
+
+```{r}
+perturbation_data = list(
+    hackett = arrow::read_parquet("~/code/hf/hackett_2020/hackett_2020.parquet"),
+    hughes_oe = arrow::read_parquet("~/code/hf/hughes_2006/overexpression.parquet"),
+    hughes_tfko = arrow::read_parquet("~/code/hf/hughes_2006/knockout.parquet"),
+    hu_reimand = arrow::read_parquet("~/code/hf/hu_2007_reimand_2010/hu_2007_reimand_2010.parquet"),
+    kemmeren = arrow::read_parquet("~/code/hf/kemmeren_2014/kemmeren_2014.parquet"),
+    degron = arrow::read_parquet( "~/code/hf/mahendrawada_2025/rnaseq_reprocessed.parquet")
+)
+
+perturbation_profiles = list(
+    # unique (regulator, time)
+    hackett = 1581,
+    kemmeren = 1484,
+    hu_reimand = 269,
+    hughes_oe = 55,
+    hughes_tfko = 51,
+    # GCN4, HSF1, MSN2 have 1 alt condition, in addition to standard
+    # GAL4 has two (no galactose, galactose) 
+    degron_standard = 126+5
+)
+
+perturbation_regulators = map(perturbation_data, ~{
+    dplyr::pull(., regulator_symbol) %>%
+        unique()
+})
+
+profile_regulators = list(
+    pr = list(
+        profiles = Reduce(sum, perturbation_profiles),
+        unique_regulators = length(Reduce(union, perturbation_regulators))
+    )
+)
+```
+
+```{r}
+binding_data = list(
+    mahendrawada_chec = 
+        arrow::read_parquet(
+            "~/code/hf/mahendrawada_2025/chec_mahendrawada_m2025_af_combined_meta.parquet"),
+    harbison = arrow::read_parquet("~/code/hf/harbison_2004/harbison_2004.parquet"),
+    barkai = list(
+            GSE222268 = arrow::read_parquet("~/code/hf/barkai_compendium/GSE222268_metadata.parquet"),
+            GSE209631 = arrow::read_parquet("~/code/hf/barkai_compendium/GSE209631_metadata.parquet"),
+            GSE178430 = arrow::read_parquet("~/code/hf/barkai_compendium/GSE178430_metadata.parquet")),
+    chipexo = arrow::read_parquet("~/code/hf/rossi_2021/rossi_2021_metadata_sample.parquet"),
+    cc = arrow::read_parquet("~/code/hf/callingcards/genome_map_meta.parquet")
+    )
+
+binding_profiles = list(
+    mahendrawada_chec = 197,
+    harbison = 352,
+    # binding_data$barkai$GSE222268 %>% filter(nchar(experiment_details) <=2),
+    # binding_data$barkai$GSE209631 %>% group_by(regulator_symbol, variant_type) %>% tally()
+    # binding_data$barkai$GSE178430 %>% group_by(regulator_symbol, dbd_donor_symbol, ortholog_donor, paralog_deletion_symbol, paralog_resistance_cassette) %>% tally()
+    barkai = 74 + 125 +135,
+    chipexo = 792,
+    cc = 243
+)
+
+barkai_unique_regulators =  c(binding_data$barkai$GSE222268 %>%
+                   filter(nchar(experiment_details) <=2) %>%
+                   pull(regulator_locus_tag) %>%
+                   unique(),
+       unique(binding_data$barkai$GSE209631$regulator_locus_tag),
+       unique(binding_data$barkai$GSE178430$regulator_locus_tag)
+      )
+barkai_unique_regulators = barkai_unique_regulators[!is.na(barkai_unique_regulators)]
+
+binding_regulators = list(
+    mahendrawada_chec = unique(binding_data$mahendrawada_chec$regulator_locus_tag),
+    harbison = unique(binding_data$harbison$regulator_locus_tag),
+    # binding_data$barkai$GSE222268 %>% filter(nchar(experiment_details) <=2),
+    # binding_data$barkai$GSE209631 %>% group_by(regulator_symbol, variant_type) %>% tally()
+    # binding_data$barkai$GSE178430 %>% group_by(regulator_symbol, dbd_donor_symbol, ortholog_donor, paralog_deletion_symbol, paralog_resistance_cassette) %>% tally()
+    barkai = barkai_unique_regulators,
+    chipexo = unique(binding_data$chipexo$regulator_locus_tag),
+    cc = unique(binding_data$cc$regulator_locus_tag)
+)
+
+profile_regulators$binding = list(
+    profiles = Reduce(sum, binding_profiles),
+    unique_regulators = length(Reduce(union, binding_regulators))
+)
+```
+
