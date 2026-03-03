@@ -3,3 +3,667 @@ title: "request_30"
 output: html_document
 ---
 
+```{r setup}
+library(tidyverse)
+library(here)
+```
+
+
+```{r}
+
+orig_af_meta = list(
+    af = arrow::read_parquet(
+            "~/code/hf/callingcards/annotated_features_meta.parquet"),
+    combined = arrow::read_parquet(
+            "~/code/hf/callingcards/annotated_features_combined_meta.parquet"),
+    gm = arrow::read_parquet("~/code/hf/callingcards/genome_map_meta.parquet")
+)
+
+orig_af_data = list(
+    af = arrow::open_dataset("~/code/hf/callingcards/annotated_features") %>%
+        collect(),
+    combined = arrow::open_dataset("~/code/hf/callingcards/annotated_features_combined") %>%
+        collect(),
+    repro = arrow::open_dataset("~/code/hf/callingcards/annotated_features_orig_reprocess") %>%
+        collect()
+)
+
+orig_af = list(
+    af = left_join(orig_af_data$af, orig_af_meta$af),
+    combined = left_join(orig_af_data$combined, orig_af_meta$combined),
+    repro = left_join(orig_af_data$repro, orig_af_meta$gm)
+)
+
+cc_analysis_set = orig_af$combined %>%
+    filter(analysis_set) %>%
+    dplyr::select(genome_map_id_set, regulator_locus_tag, regulator_symbol, condition,
+                  target_locus_tag, target_symbol,
+                  callingcards_enrichment, poisson_pval) %>%
+    dplyr::rename(gm_id = genome_map_id_set) %>%
+    bind_rows(
+        orig_af$af %>%
+            filter(analysis_set) %>%
+            dplyr::select(id, regulator_locus_tag, regulator_symbol, condition,
+                          target_locus_tag, target_symbol,
+                          callingcards_enrichment, poisson_pval) %>%
+            dplyr::rename(gm_id = id) %>%
+            mutate(gm_id = as.character(gm_id))
+    )
+
+```
+
+```{r}
+binding_data = list(
+    cc = cc_analysis_set,
+    harbison = arrow::read_parquet("~/code/hf/harbison_2004/harbison_2004.parquet") %>%
+        filter(condition == "YPD") %>%
+        group_by(sample_id, target_locus_tag) %>%
+        slice(which.min(pvalue)) %>%
+        ungroup(),
+    mahendrawada_chec = arrow::read_parquet(
+        "~/code/hf/mahendrawada_2025/chec_mahendrawada_m2025_af_combined.parquet") %>%
+        left_join(
+            arrow::read_parquet(
+                "~/code/hf/mahendrawada_2025/chec_mahendrawada_m2025_af_combined_meta.parquet")) %>%
+                filter(condition == "standard"),
+    chipexo = arrow::read_parquet("~/code/hf/rossi_2021/rossi_2021_af_combined.parquet") %>%
+        left_join(
+            arrow::read_parquet("~/code/hf/rossi_2021/rossi_2021_metadata_sample.parquet")
+        ) %>%
+        filter(treatment == "Normal", growth_media == "YPD")
+)
+```
+
+```{r}
+library(future)
+library(future.apply)
+library(progressr)
+library(data.table)
+
+plan(multisession, workers = 6)
+data.table::setDTthreads(5)
+
+group_cols_standard = c('sample_id', 'regulator_locus_tag', 'regulator_symbol',
+                        'target_locus_tag', 'target_symbol')
+group_cols_hu = c(group_cols_standard, 'heat_shock', 'tetracycline_treatment')
+
+dedup_by_max_abs_fc = function(path, group_cols) {
+    dt = data.table::as.data.table(arrow::read_parquet(path))
+    dt[dt[, .I[which.max(abs(mean_norm_log2fc))], by = group_cols]$V1]
+}
+
+dedup_by_min_pval = function(path, group_cols, pval_col, pre_filter = NULL) {
+    dt = data.table::as.data.table(arrow::read_parquet(path))
+    if (!is.null(pre_filter)) dt = pre_filter(dt)
+    dt[dt[, .I[which.min(get(pval_col))], by = group_cols]$V1]
+}
+
+tasks = list(
+    hackett = function() arrow::read_parquet("~/code/hf/hackett_2020/hackett_2020.parquet"),
+    hughes_oe = function() dedup_by_max_abs_fc(
+        "~/code/hf/hughes_2006/overexpression.parquet", group_cols_standard),
+    hughes_tfko = function() dedup_by_max_abs_fc(
+        "~/code/hf/hughes_2006/knockout.parquet", group_cols_standard),
+    hu_reimand = function() dedup_by_min_pval(
+        "~/code/hf/hu_2007_reimand_2010/hu_2007_reimand_2010.parquet",
+        group_cols_hu, 'pval'),
+    kemmeren = function() dedup_by_min_pval(
+        "~/code/hf/kemmeren_2014/kemmeren_2014.parquet",
+        group_cols_standard, 'pval'),
+    degron = function() dedup_by_min_pval(
+        "~/code/hf/mahendrawada_2025/rnaseq_reprocessed.parquet",
+        group_cols_standard, 'padj',
+        pre_filter = function(dt) dt[env_condition == 'standard_30C'])
+)
+
+plan(multisession, workers = 6)
+data.table::setDTthreads(5)
+
+# verify workers are actually spawned
+print(future::nbrOfWorkers())
+
+handlers(global = TRUE)
+handlers("progress")  # or "cli" if you have the cli package
+
+with_progress({
+    p = progressor(along = tasks)
+    
+    perturbation_data = future_lapply(tasks, function(f) {
+        result = f()
+        p()  # tick progress
+        result
+    }, future.seed = TRUE)
+})
+
+plan(sequential)
+```
+
+```{r}
+hackett_meta = perturbation_data$hackett %>%
+    select(sample_id, regulator_locus_tag, regulator_symbol,
+           time, mechanism, restriction, date, strain) %>%
+    distinct()
+
+# the following have multiple entries
+# GCN4, date 20150101 and 20150903,
+# RDS2 date 20160504 and 20160823
+# SWI1 same date, strain SMY2266a and SMY2266b
+zev_p_regulators_df = hackett_meta %>%
+    select(-time, -sample_id) %>%
+    distinct() %>%
+    filter(mechanism == "ZEV", restriction == "P")
+
+non_zev_p_regulators_df = hackett_meta %>%
+    select(-time, -sample_id) %>%
+    distinct() %>%
+    filter(regulator_locus_tag %in%
+               setdiff(hackett_meta$regulator_locus_tag,
+                       zev_p_regulators_df$regulator_locus_tag))
+
+# MAC1 has multiple strains, SMY170 and ySMY170
+gev_p_only_regulators_df = non_zev_p_regulators_df %>%
+    filter(restriction == "P")
+
+non_zev_and_gev_p_regulators_df = hackett_meta %>%
+    select(-time, -sample_id) %>%
+    distinct() %>%
+    filter(regulator_locus_tag %in%
+               setdiff(hackett_meta$regulator_locus_tag,
+                       union(zev_p_regulators_df$regulator_locus_tag,
+                             gev_p_only_regulators_df$regulator_locus_tag)))
+
+hackett_analysis_set = hackett_meta %>%
+    filter((regulator_locus_tag %in% zev_p_regulators_df$regulator_locus_tag
+           & mechanism == "ZEV" & restriction == "P")
+           |(regulator_locus_tag %in% gev_p_only_regulators_df$regulator_locus_tag
+             & mechanism == "GEV" & restriction == "P")
+           | (regulator_locus_tag %in% non_zev_and_gev_p_regulators_df$regulator_locus_tag
+              & mechanism == "GEV" & restriction == "M"))
+
+hackett_analysis_set_no_replicates = hackett_analysis_set %>%
+    filter(!regulator_symbol %in% c('GCN4', 'RDS2', 'SWI1', 'MAC1'))
+
+hackett_time_join_df = hackett_analysis_set_no_replicates %>%
+    select(sample_id, time) %>%
+    dplyr::rename(pert_sample_id = sample_id) %>%
+    mutate(
+        pert_sample_id = as.character(pert_sample_id),
+        time = as.character(time))
+    
+```
+
+```{r}
+perturbation_data$hackett_cleaned = perturbation_data$hackett %>%
+    filter(sample_id %in% hackett_analysis_set_no_replicates$sample_id) %>%
+    group_by(sample_id, target_locus_tag) %>%
+    slice(which.max(abs(log2_cleaned_ratio))) %>%
+    ungroup()
+```
+
+
+```{r}
+dto  = arrow::open_dataset("~/code/hf/yeast_comparative_analysis/dto") %>%
+    filter(pr_ranking_column == "log2fc")
+
+dto_parsed = list(
+    cc = bind_rows(
+        dto %>%
+            filter(binding_repo_dataset == "callingcards-annotated_features_combined") %>%
+            collect() %>%
+            mutate(gm_id = str_extract(binding_id, "[^;]+$")) %>%
+            select(-binding_id),
+        dto %>%
+            filter(binding_repo_dataset == "callingcards-annotated_features") %>%
+            collect() %>%
+            mutate(gm_id = str_extract(binding_id, "[^;]+$"),
+                   pert_sample_id = str_extract(perturbation_id, "[^;]+$")) %>%
+            select(-c(binding_id, perturbation_id))) %>%
+        filter((perturbation_repo_dataset == "hackett_2020-hackett_2020"
+               & pert_sample_id %in% hackett_analysis_set_no_replicates$sample_id)
+               | perturbation_repo_dataset != "hackett_2020-hackett_2020") %>%
+        left_join(hackett_time_join_df) %>%
+        replace_na(list(time = "standard")) %>%
+        filter(gm_id %in% binding_data$cc$gm_id) %>%
+        ungroup() %>%
+        mutate(binding_source = "2026 Calling Cards"),
+    
+    harbison = dto %>%
+        filter(binding_repo_dataset == "harbison_2004-harbison_2004") %>%
+        collect() %>%
+        mutate(gm_id = str_extract(binding_id, "[^;]+$"),
+                   pert_sample_id = str_extract(perturbation_id, "[^;]+$")) %>%
+            select(-c(binding_id, perturbation_id)) %>%
+        filter((perturbation_repo_dataset == "hackett_2020-hackett_2020"
+               & pert_sample_id %in% hackett_analysis_set_no_replicates$sample_id)
+               | perturbation_repo_dataset != "hackett_2020-hackett_2020") %>%
+        left_join(hackett_time_join_df) %>%
+        replace_na(list(time = "standard")) %>%
+        filter(gm_id %in% binding_data$harbison$sample_id) %>%
+        mutate(binding_source = "2004 ChIP-chip"),
+    
+    mchec = dto %>%
+        filter(binding_repo_dataset == "mahendrawada_2025-chec_mahendrawada_m2025_af_combined") %>%
+        collect() %>%
+        mutate(gm_id = str_extract(binding_id, "[^;]+$"),
+                   pert_sample_id = str_extract(perturbation_id, "[^;]+$")) %>%
+            select(-c(binding_id, perturbation_id)) %>%
+        filter((perturbation_repo_dataset == "hackett_2020-hackett_2020"
+               & pert_sample_id %in% hackett_analysis_set_no_replicates$sample_id)
+               | perturbation_repo_dataset != "hackett_2020-hackett_2020") %>%
+        left_join(hackett_time_join_df) %>%
+        replace_na(list(time = "standard")) %>%
+        filter(gm_id %in% binding_data$mahendrawada_chec$sample_id ) %>%
+        mutate(binding_source = "2025 ChEC"),
+    
+    rossi = dto %>%
+        filter(binding_repo_dataset == "rossi_2021-rossi_2021_af_combined") %>%
+        collect() %>%
+        mutate(gm_id = str_extract(binding_id, "[^;]+$"),
+                   pert_sample_id = str_extract(perturbation_id, "[^;]+$")) %>%
+            select(-c(binding_id, perturbation_id)) %>%
+        filter((perturbation_repo_dataset == "hackett_2020-hackett_2020"
+               & pert_sample_id %in% hackett_analysis_set_no_replicates$sample_id)
+               | perturbation_repo_dataset != "hackett_2020-hackett_2020") %>%
+        left_join(hackett_time_join_df) %>%
+        replace_na(list(time = "standard")) %>%
+        filter(gm_id %in% binding_data$chipexo$sample_id ) %>%
+        mutate(binding_source = "2021 ChIPexo")
+    )
+```
+
+```{r}
+mahendrawada_features = arrow::read_parquet("~/code/hf/mahendrawada_2025/features_mahendrawada_2025.parquet")
+
+
+# note that all of the perturbation sets have the key `sample_id`
+join_binding_perturbation = function(binding_name,
+                                     perturbation_name,
+                                     target_blacklist = NULL){
+    out = binding_data[[binding_name]] %>%
+        left_join(
+            perturbation_data[[perturbation_name]] %>%
+                dplyr::rename(perturbation_id = sample_id) %>%
+                select(perturbation_id, regulator_locus_tag,
+                       target_locus_tag, target_symbol, responsive)) %>%
+        filter(regulator_locus_tag != target_locus_tag) %>%
+        filter(target_locus_tag %in% mahendrawada_features$locus_tag) %>%
+        filter(complete.cases(.))
+    
+    if(!is.null(target_blacklist)){
+        message('removing blacklisted genes')
+        out %>%
+            filter(!target_locus_tag %in% target_blacklist)
+    } else{
+        out
+    }
+}
+
+# # A tibble: 5 × 2
+#   target_symbol target_locus_tag
+#   <chr>         <chr>           
+# 1 MRM1          YOR201C         
+# 2 HIS3          YOR202W         
+# 3 unknown_6326  YOR203W         
+# 4 LEU2          YCL018W         
+# 5 URA3          YEL021W  
+
+binding_perturbation_joined = list(
+    cc = list(
+        hackett = join_binding_perturbation('cc', 'hackett_cleaned',
+                                            target_blacklist = c('YOR201C',
+                                                                 'YOR202W',
+                                                                 'YOR203W',
+                                                                 'YCL018W',
+                                                                 'YEL021W')) %>%
+            mutate(perturbation_id = as.character(perturbation_id)) %>%
+            dplyr::rename(sample_id = gm_id) %>%
+            left_join(dplyr::rename(hackett_time_join_df, perturbation_id = pert_sample_id)) %>%
+            group_by(sample_id, perturbation_id) %>%
+            arrange(desc(callingcards_enrichment)) %>%
+            arrange(poisson_pval) %>%
+            # if there are ties, then take the max rank that results in
+            # <= 25 hits
+            mutate(rank = rank(poisson_pval, ties.method = "max")) %>%
+            mutate(top25 = rank <= 25),
+        
+        hughes_oe = join_binding_perturbation('cc', 'hughes_oe',
+                                            target_blacklist = c('YOR201C',
+                                                                 'YOR202W',
+                                                                 'YOR203W',
+                                                                 'YCL018W',
+                                                                 'YEL021W')) %>%
+            dplyr::rename(sample_id = gm_id) %>%
+            group_by(sample_id, perturbation_id) %>%
+            arrange(desc(callingcards_enrichment)) %>%
+            arrange(poisson_pval) %>%
+            # if there are ties, then take the max rank that results in
+            # <= 25 hits
+            mutate(rank = rank(poisson_pval, ties.method = "max")) %>%
+            mutate(top25 = rank <= 25),
+        hughes_tfko = join_binding_perturbation('cc', 'hughes_tfko',
+                                            target_blacklist = c('YOR201C',
+                                                                 'YOR202W',
+                                                                 'YOR203W',
+                                                                 'YCL018W',
+                                                                 'YEL021W')) %>%
+            dplyr::rename(sample_id = gm_id) %>%
+            group_by(sample_id, perturbation_id) %>%
+            arrange(desc(callingcards_enrichment)) %>%
+            arrange(poisson_pval) %>%
+            # if there are ties, then take the max rank that results in
+            # <= 25 hits
+            mutate(rank = rank(poisson_pval, ties.method = "max")) %>%
+            mutate(top25 = rank <= 25),
+        hu_reimand = join_binding_perturbation('cc', 'hu_reimand',
+                                            target_blacklist = c('YOR201C',
+                                                                 'YOR202W',
+                                                                 'YOR203W',
+                                                                 'YCL018W',
+                                                                 'YEL021W')) %>%
+            dplyr::rename(sample_id = gm_id) %>%
+            group_by(sample_id, perturbation_id) %>%
+            arrange(desc(callingcards_enrichment)) %>%
+            arrange(poisson_pval) %>%
+            # if there are ties, then take the max rank that results in
+            # <= 25 hits
+            mutate(rank = rank(poisson_pval, ties.method = "max")) %>%
+            mutate(top25 = rank <= 25),
+        kemmeren = join_binding_perturbation('cc', 'kemmeren',
+                                            target_blacklist = c('YOR201C',
+                                                                 'YOR202W',
+                                                                 'YOR203W',
+                                                                 'YCL018W',
+                                                                 'YEL021W')) %>%
+            dplyr::rename(sample_id = gm_id) %>%
+            group_by(sample_id, perturbation_id) %>%
+            arrange(desc(callingcards_enrichment)) %>%
+            arrange(poisson_pval) %>%
+            # if there are ties, then take the max rank that results in
+            # <= 25 hits
+            mutate(rank = rank(poisson_pval, ties.method = "max")) %>%
+            mutate(top25 = rank <= 25),
+        degron = join_binding_perturbation('cc', 'degron',
+                                            target_blacklist = c('YOR201C',
+                                                                 'YOR202W',
+                                                                 'YOR203W',
+                                                                 'YCL018W',
+                                                                 'YEL021W')) %>%
+            dplyr::rename(sample_id = gm_id) %>%
+            group_by(sample_id, perturbation_id) %>%
+            arrange(desc(callingcards_enrichment)) %>%
+            arrange(poisson_pval) %>%
+            # if there are ties, then take the max rank that results in
+            # <= 25 hits
+            mutate(rank = rank(poisson_pval, ties.method = "max")) %>%
+            mutate(top25 = rank <= 25)),
+    harbison = list(
+        hackett = join_binding_perturbation('harbison', 'hackett_cleaned') %>%
+            mutate(perturbation_id = as.character(perturbation_id)) %>%
+            left_join(dplyr::rename(hackett_time_join_df, perturbation_id = pert_sample_id)) %>%
+            group_by(sample_id, perturbation_id) %>%
+            arrange(pvalue) %>%
+            # if there are ties, then take the max rank that results in
+            # <= 25 hits
+            mutate(rank = rank(pvalue, ties.method = "max")) %>%
+            mutate(top25 = rank <= 25),
+        hughes_oe = join_binding_perturbation('harbison', 'hughes_oe') %>%
+            group_by(sample_id, perturbation_id) %>%
+            arrange(pvalue) %>%
+            # if there are ties, then take the max rank that results in
+            # <= 25 hits
+            mutate(rank = rank(pvalue, ties.method = "max")) %>%
+            mutate(top25 = rank <= 25),
+        hughes_tfko = join_binding_perturbation('harbison', 'hughes_tfko') %>%
+            group_by(sample_id, perturbation_id) %>%
+            arrange(pvalue) %>%
+            # if there are ties, then take the max rank that results in
+            # <= 25 hits
+            mutate(rank = rank(pvalue, ties.method = "max")) %>%
+            mutate(top25 = rank <= 25),
+        hu_reimand = join_binding_perturbation('harbison', 'hu_reimand') %>%
+            group_by(sample_id, perturbation_id) %>%
+            arrange(pvalue) %>%
+            # if there are ties, then take the max rank that results in
+            # <= 25 hits
+            mutate(rank = rank(pvalue, ties.method = "max")) %>%
+            mutate(top25 = rank <= 25),
+        kemmeren = join_binding_perturbation('harbison', 'kemmeren') %>%
+            group_by(sample_id, perturbation_id) %>%
+            arrange(pvalue) %>%
+            # if there are ties, then take the max rank that results in
+            # <= 25 hits
+            mutate(rank = rank(pvalue, ties.method = "max")) %>%
+            mutate(top25 = rank <= 25),
+        degron = join_binding_perturbation('harbison', 'degron') %>%
+            group_by(sample_id, perturbation_id) %>%
+            arrange(pvalue) %>%
+            # if there are ties, then take the max rank that results in
+            # <= 25 hits
+            mutate(rank = rank(pvalue, ties.method = "max")) %>%
+            mutate(top25 = rank <= 25)),
+    mchec = list(
+        hackett = join_binding_perturbation('mahendrawada_chec', 'hackett_cleaned') %>%
+            mutate(perturbation_id = as.character(perturbation_id)) %>%
+            left_join(dplyr::rename(hackett_time_join_df, perturbation_id = pert_sample_id)) %>%
+            group_by(sample_id, perturbation_id) %>%
+            arrange(desc(enrichment)) %>%
+            arrange(log_poisson_pval) %>%
+            # if there are ties, then take the max rank that results in
+            # <= 25 hits
+            mutate(rank = rank(log_poisson_pval, ties.method = "max")) %>%
+            mutate(top25 = rank <= 25),
+        
+        hughes_oe = join_binding_perturbation('mahendrawada_chec', 'hughes_oe') %>%
+            group_by(sample_id, perturbation_id) %>%
+            arrange(desc(enrichment)) %>%
+            arrange(log_poisson_pval) %>%
+            # if there are ties, then take the max rank that results in
+            # <= 25 hits
+            mutate(rank = rank(log_poisson_pval, ties.method = "max")) %>%
+            mutate(top25 = rank <= 25),
+        hughes_tfko = join_binding_perturbation('mahendrawada_chec', 'hughes_tfko') %>%
+            group_by(sample_id, perturbation_id) %>%
+            arrange(desc(enrichment)) %>%
+            arrange(log_poisson_pval) %>%
+            # if there are ties, then take the max rank that results in
+            # <= 25 hits
+            mutate(rank = rank(log_poisson_pval, ties.method = "max")) %>%
+            mutate(top25 = rank <= 25),
+        hu_reimand = join_binding_perturbation('mahendrawada_chec', 'hu_reimand') %>%
+            group_by(sample_id, perturbation_id) %>%
+            arrange(desc(enrichment)) %>%
+            arrange(log_poisson_pval) %>%
+            # if there are ties, then take the max rank that results in
+            # <= 25 hits
+            mutate(rank = rank(log_poisson_pval, ties.method = "max")) %>%
+            mutate(top25 = rank <= 25),
+        kemmeren = join_binding_perturbation('mahendrawada_chec', 'kemmeren') %>%
+            group_by(sample_id, perturbation_id) %>%
+            arrange(desc(enrichment)) %>%
+            arrange(log_poisson_pval) %>%
+            # if there are ties, then take the max rank that results in
+            # <= 25 hits
+            mutate(rank = rank(log_poisson_pval, ties.method = "max")) %>%
+            mutate(top25 = rank <= 25),
+        degron = join_binding_perturbation('mahendrawada_chec', 'degron') %>%
+            group_by(sample_id, perturbation_id) %>%
+            arrange(desc(enrichment)) %>%
+            arrange(log_poisson_pval) %>%
+            # if there are ties, then take the max rank that results in
+            # <= 25 hits
+            mutate(rank = rank(log_poisson_pval, ties.method = "max")) %>%
+            mutate(top25 = rank <= 25)),
+    chipexo = list(
+        hackett = join_binding_perturbation('chipexo', 'hackett_cleaned') %>%
+            mutate(perturbation_id = as.character(perturbation_id)) %>%
+            left_join(dplyr::rename(hackett_time_join_df, perturbation_id = pert_sample_id)) %>%
+            group_by(sample_id, perturbation_id) %>%
+            arrange(desc(enrichment)) %>%
+            arrange(log_poisson_pval) %>%
+            # if there are ties, then take the max rank that results in
+            # <= 25 hits
+            mutate(rank = rank(log_poisson_pval, ties.method = "max")) %>%
+            mutate(top25 = rank <= 25),
+        hughes_oe = join_binding_perturbation('chipexo', 'hughes_oe') %>%
+            group_by(sample_id, perturbation_id) %>%
+            arrange(desc(enrichment)) %>%
+            arrange(log_poisson_pval) %>%
+            # if there are ties, then take the max rank that results in
+            # <= 25 hits
+            mutate(rank = rank(log_poisson_pval, ties.method = "max")) %>%
+            mutate(top25 = rank <= 25),
+        hughes_tfko = join_binding_perturbation('chipexo', 'hughes_tfko') %>%
+            group_by(sample_id, perturbation_id) %>%
+            arrange(desc(enrichment)) %>%
+            arrange(log_poisson_pval) %>%
+            # if there are ties, then take the max rank that results in
+            # <= 25 hits
+            mutate(rank = rank(log_poisson_pval, ties.method = "max")) %>%
+            mutate(top25 = rank <= 25),
+        hu_reimand = join_binding_perturbation('chipexo', 'hu_reimand') %>%
+            group_by(sample_id, perturbation_id) %>%
+            arrange(desc(enrichment)) %>%
+            arrange(log_poisson_pval) %>%
+            # if there are ties, then take the max rank that results in
+            # <= 25 hits
+            mutate(rank = rank(log_poisson_pval, ties.method = "max")) %>%
+            mutate(top25 = rank <= 25),
+        kemmeren = join_binding_perturbation('chipexo', 'kemmeren') %>%
+            group_by(sample_id, perturbation_id) %>%
+            arrange(desc(enrichment)) %>%
+            arrange(log_poisson_pval) %>%
+            # if there are ties, then take the max rank that results in
+            # <= 25 hits
+            mutate(rank = rank(log_poisson_pval, ties.method = "max")) %>%
+            mutate(top25 = rank <= 25),
+        degron = join_binding_perturbation('chipexo', 'degron') %>%
+            group_by(sample_id, perturbation_id) %>%
+            arrange(desc(enrichment)) %>%
+            arrange(log_poisson_pval) %>%
+            # if there are ties, then take the max rank that results in
+            # <= 25 hits
+            mutate(rank = rank(log_poisson_pval, ties.method = "max")) %>%
+            mutate(top25 = rank <= 25)
+    )
+    
+)
+
+```
+
+```{r}
+binding_source_map = list(
+    cc = "2026 Calling Cards",
+    harbison = "2004 ChIP-chip",
+    mchec = "2025 Chec-seq",
+    chipexo = "2021 ChIPexo"
+)
+
+perturbation_source_map = list(
+    hackett = "2020 Overexpression",
+    hughes_oe = "2006 Overexpression",
+    hughes_tfko = "2006 TFKO",
+    hu_reimand = "2007 TFKO",
+    kemmeren = "2014 TFKO",
+    degron = "2025 Degron"
+)
+
+cc_plots = function(bsource, psource){
+    message(sprintf(" working on %s vs %s", bsource, psource))
+    if(psource == "hackett"){
+        out = binding_perturbation_joined[[bsource]][[psource]] %>%
+            filter(time == 45) %>%
+            group_by(sample_id, perturbation_id) %>%
+            filter(top25) %>%
+            reframe(
+                n = n(),
+                responsive_ratio = sum(responsive) / n())
+    } else{
+        out = binding_perturbation_joined[[bsource]][[psource]] %>%
+            group_by(sample_id, perturbation_id) %>%
+            filter(top25) %>%
+            reframe(
+                n = n(),
+                responsive_ratio = sum(responsive) / n())
+    }
+    
+    out %>%
+        mutate(perturbation_id = as.character(perturbation_id),
+               sample_id = as.character(sample_id)) %>%
+        mutate(binding_source = binding_source_map[[bsource]],
+               perturbation_source = perturbation_source_map[[psource]])
+}
+
+binding_perturbation_summary = expand.grid(
+    bsource = names(binding_perturbation_joined),
+    psource = names(binding_perturbation_joined$cc),
+    stringsAsFactors = FALSE
+) %>%
+    pmap(function(bsource, psource) {
+        cc_plots(bsource, psource)
+    }) %>%
+    bind_rows()
+```
+
+```{r}
+nature_colors = c(
+    "2004 ChIP-chip"     = "#E64B35",
+    "2021 ChIPexo"       = "#F39B7F",
+    "2025 Chec-seq"      = "#00A087",
+    "2026 Calling Cards" = "#3C5488"
+)
+
+binding_perturbation_summary %>%
+    filter(perturbation_source %in% c("2007 TFKO", "2020 Overexpression", "2025 Degron")) %>%
+    mutate(percent_responsive = responsive_ratio * 100) %>%
+    ggplot(aes(binding_source, percent_responsive, fill = binding_source)) +
+    geom_boxplot() +
+    facet_grid(~perturbation_source) +
+    scale_fill_manual(values = nature_colors, name = "Binding Source") +
+    scale_y_continuous(breaks = seq(0,100, 25)) +
+    ylab("Percent Responsive in Top 25 by Binding") +
+    theme_bw() +
+    theme(
+        text = element_text(size = 14),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.x = element_blank(),
+        legend.position = c(0.01, 0.99),
+        legend.justification = c(0, 1),
+        legend.background = element_rect(colour = "grey80"),
+        legend.key.size = unit(0.4, "cm"),
+        legend.text = element_text(size = 10),
+        legend.title = element_text(size = 10)
+    )
+```
+
+```{r}
+perturbation_colors = c(
+    "2007 TFKO"           = "#8491B4",
+    "2020 Overexpression" = "#91D1C2",
+    "2025 Degron"         = "#B09C85"
+)
+
+binding_perturbation_summary %>%
+    filter(perturbation_source %in% c("2007 TFKO", "2020 Overexpression", "2025 Degron")) %>%
+    mutate(percent_responsive = responsive_ratio * 100) %>%
+    ggplot(aes(perturbation_source, percent_responsive, fill = perturbation_source)) +
+    geom_boxplot() +
+    facet_grid(~binding_source) +
+    scale_fill_manual(values = perturbation_colors, name = "Perturbation Source") +
+    scale_y_continuous(breaks = seq(0, 100, 25)) +
+    ylab("Percent Responsive in Top 25 by Binding") +
+    theme_bw() +
+    theme(
+        text = element_text(size = 14),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.x = element_blank(),
+        legend.position = c(0.01, 0.99),
+        legend.justification = c(0, 1),
+        legend.background = element_rect(colour = "grey80"),
+        legend.key.size = unit(0.4, "cm"),
+        legend.text = element_text(size = 10),
+        legend.title = element_text(size = 10)
+    )
+```
+

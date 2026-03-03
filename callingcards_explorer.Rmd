@@ -27,23 +27,49 @@ use_virtualenv(venv_path, required = TRUE)
 ```{r}
 library(arrow)
 
+orig_af_meta = list(
+    af = arrow::read_parquet(
+            "~/code/hf/callingcards/annotated_features_meta.parquet"),
+    combined = arrow::read_parquet(
+            "~/code/hf/callingcards/annotated_features_combined_meta.parquet"),
+    gm = arrow::read_parquet("~/code/hf/callingcards/genome_map_meta.parquet")
+)
+
+orig_af_data = list(
+    af = arrow::open_dataset("~/code/hf/callingcards/annotated_features") %>%
+        collect(),
+    combined = arrow::open_dataset("~/code/hf/callingcards/annotated_features_combined") %>%
+        collect(),
+    repro = arrow::open_dataset("~/code/hf/callingcards/annotated_features_orig_reprocess") %>%
+        collect()
+)
+
 orig_af = list(
-    af = 
-        arrow::open_dataset("~/code/hf/callingcards/annotated_features") %>%
-        collect() %>%
-        left_join(arrow::read_parquet(
-            "~/code/hf/callingcards/annotated_features_meta.parquet")),
-    combined =
-        arrow::open_dataset("~/code/hf/callingcards/annotated_features_combined") %>%
-        collect() %>%
-        left_join(arrow::read_parquet(
-            "~/code/hf/callingcards/annotated_features_combined_meta.parquet")),
-    repro =
-        arrow::open_dataset("~/code/hf/callingcards/annotated_features_orig_reprocess") %>%
-        collect() %>%
-        left_join(arrow::read_parquet("~/code/hf/callingcards/genome_map_meta.parquet"))
+    af = left_join(orig_af_data$af, orig_af_meta$af),
+    combined = left_join(orig_af_data$combined, orig_af_meta$combined),
+    repro = left_join(orig_af_data$repro, orig_af_meta$gm)
 )
 
 
 ```
+
+```{r}
+x = read_csv("~/htcf_ref/data/yeast_database_modelling/pull_data_20250805/data/brent_nf_cc_meta_20250805.csv")
+```
+
+```{r}
+orig_af_meta_with_analysis_col = orig_af_meta$af  %>%
+    mutate(analysis_set = pss_id %in% x$id)
+
+# arrow::write_parquet(orig_af_meta_with_analysis_col,
+#                      "~/code/hf/callingcards/annotated_features_meta.parquet")
+
+orig_af_combined_with_analysis_col = orig_af_meta$combined %>%
+    mutate(analysis_set = TRUE)
+
+# arrow::write_parquet(orig_af_combined_with_analysis_col,
+#                      "~/code/hf/callingcards/annotated_features_combined_meta.parquet")
+```
+
+
 
